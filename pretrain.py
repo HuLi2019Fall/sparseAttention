@@ -13,8 +13,8 @@ from transformers import (
     TrainerCallback,
 )
 from itertools import chain
-from modeling_qwen3 import Qwen3ForCausalLM
-from configuration_qwen3 import Qwen3Config
+from model.modeling_qwen3 import Qwen3ForCausalLM
+from model.configuration_qwen3 import Qwen3Config
 
 # ------------------------------------------------------------
 # 1. Setup
@@ -110,20 +110,24 @@ print("Initializing model...")
 
 # config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
 config = Qwen3Config()
+config.use_nsa = True
+model = Qwen3ForCausalLM(
+    config,
+)
 
 # Attempt to use Flash Attention 2
-try:
-    config._attn_implementation = "flash_attention_2"
-    model = Qwen3ForCausalLM(
-        config,
-    )
-    print("✓ Using Flash Attention 2")
-except Exception as e:
-    print(f"Flash Attention 2 not available: {e}")
-    config._attn_implementation = "sdpa"
-    model = Qwen3ForCausalLM(
-        config,
-    )
+# try:
+#     config._attn_implementation = "flash_attention_2"
+#     model = Qwen3ForCausalLM(
+#         config,
+#     )
+#     print("✓ Using Flash Attention 2")
+# except Exception as e:
+#     print(f"Flash Attention 2 not available: {e}")
+#     config._attn_implementation = "sdpa"
+#     model = Qwen3ForCausalLM(
+#         config,
+#     )
 
 model.to(torch.bfloat16)
 model.to(device="cuda", dtype=torch.bfloat16)
@@ -229,10 +233,10 @@ training_args = TrainingArguments(
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
     # 5. Training config
-    max_steps=300,
+    max_steps=50,
     learning_rate=5e-4,
     lr_scheduler_type="cosine",
-    warmup_steps=30,
+    warmup_steps=10,
     optim="adamw_torch_fused",
     # 6. Logging
     logging_steps=10,
