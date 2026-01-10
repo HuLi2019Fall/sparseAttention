@@ -37,10 +37,15 @@ from transformers.utils import (
 )
 from .configuration_qwen3 import Qwen3Config
 
+logger = logging.get_logger(__name__)
+try:
+    from native_sparse_attention.modeling_nsa import NativeSparseAttention
+except ImportError:
+    NativeSparseAttention = None
+
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
-logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Qwen3Config"
 
@@ -425,180 +430,6 @@ class Qwen3Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class Qwen3DMAAttention(nn.Module):
-    """
-    Pure PyTorch implementation of Dynamic Mask Attention (DMA).
-    Faithful to arXiv:2508.02124 Listing 1 and Equations 3-5.
-    """
-
-    def __init__(self, config: Qwen3Config, layer_idx: Optional[int] = None):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.hidden_size = config.hidden_size
-        self.is_causal = True
-        self.attention_dropout = config.attention_dropout
-
-        # Standard Projections
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
-        )
-
-        # --- DMA Learnable Parameters ---
-        self.W_dt = nn.Linear(
-            self.num_key_value_heads * self.head_dim, self.num_heads, bias=False
-        )
-        self.dma_gate = nn.Parameter(torch.zeros(self.num_heads))
-        self.dma_window_size = getattr(config, "dma_window_size", 128)
-
-        # Use Qwen3RotaryEmbedding defined in the file
-        self.rotary_emb = Qwen3RotaryEmbedding(config=self.config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        # 1. Projections
-        query_states = (
-            self.q_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        key_states = (
-            self.k_proj(hidden_states)
-            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        value_states = (
-            self.v_proj(hidden_states)
-            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-
-        # 2. RoPE Rotation
-        if position_embeddings is None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
-
-        # 3. KV Cache Update
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        kv_len = key_states.shape[2]
-
-        # --- DMA Logic Start ---
-
-        # A. Calculate Importance Scores
-        v_flat = value_states.transpose(1, 2).reshape(bsz, kv_len, -1)
-        dt = self.W_dt(v_flat)
-        dt = torch.nn.functional.softplus(dt)
-        dt = torch.exp(dt * self.dma_gate)
-        dma_scores = dt.transpose(1, 2)
-
-        # B. Generate Dynamic Mask (Top-W)
-        if kv_len > self.dma_window_size:
-            top_w_vals, top_w_indices = torch.topk(
-                dma_scores, k=self.dma_window_size, dim=-1
-            )
-            dma_mask = torch.full_like(dma_scores, float("-inf"))
-            dma_mask.scatter_(-1, top_w_indices, top_w_vals)
-        else:
-            dma_mask = dma_scores
-
-        dma_mask = dma_mask.unsqueeze(2).expand(-1, -1, q_len, -1)
-        # --- DMA Logic End ---
-
-        # 4. Repeat KV for GQA
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # 5. Attention Calculation
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-
-        # Apply DMA Bias (Scores + Mask)
-        attn_weights = attn_weights + dma_mask
-
-        # --- CORRECTED MASK HANDLING ---
-        if attention_mask is not None:
-            # Case 1: 2D Mask (common in FlashAttn configs) -> [Batch, SeqLen]
-            if attention_mask.dim() == 2:
-                # Expand to [Batch, 1, 1, SeqLen]
-                mask_expanded = attention_mask[:, None, None, :].to(attn_weights.device)
-
-                # Align sequence length (slice if mask is longer than current kv_len)
-                if mask_expanded.size(-1) > kv_len:
-                    mask_expanded = mask_expanded[:, :, :, :kv_len]
-
-                # Convert Binary (1=Keep) to Additive (0=Keep, -inf=Mask)
-                # Note: standard attention_mask is 1 for keep, 0 for masked
-                inv_mask = 1.0 - mask_expanded
-                min_dtype = torch.finfo(attn_weights.dtype).min
-                causal_mask = inv_mask * min_dtype
-
-                attn_weights = attn_weights + causal_mask.to(attn_weights.dtype)
-
-            # Case 2: 4D Mask (Standard Eager) -> [Batch, 1, QLen, KVLen]
-            elif attention_mask.dim() == 4:
-                if attention_mask.size(-1) > kv_len:
-                    causal_mask = attention_mask[:, :, :, :kv_len]
-                else:
-                    causal_mask = attention_mask
-                attn_weights = attn_weights + causal_mask
-        # -------------------------------
-
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
-
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, attn_weights, past_key_value
-
-
 class Qwen3FlashAttention2(Qwen3Attention):
     """
     Qwen3 flash attention module, following Qwen3 attention module. This module inherits from `Qwen3Attention`
@@ -888,11 +719,94 @@ class Qwen3SdpaAttention(Qwen3Attention):
         return attn_output, None, past_key_value
 
 
+class Qwen3NativeSparseAttention(nn.Module):
+    """
+    Wrapper for Native Sparse Attention (NSA) compatible with Qwen3.
+
+    CRITICAL CONSTRAINTS:
+    1. block_size must be >= 64 for kernel alignment.
+    2. Group Size (num_heads / num_kv_heads) must be a multiple of 16.
+    """
+
+    def __init__(self, config: Qwen3Config, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+
+        # 1. Validation: Check Installation
+        if NativeSparseAttention is None:
+            raise ImportError(
+                "native-sparse-attention is not installed. "
+                "Please run `pip install -e .` from the fla-org repo."
+            )
+
+        # 2. Validation: Check GQA Ratio Constraint
+        gqa_ratio = self.num_heads // self.num_key_value_heads
+        if gqa_ratio % 16 != 0:
+            raise ValueError(
+                f"Native Sparse Attention architecture constraint violation:\n"
+                f"The ratio of (Attention Heads / KV Heads) must be a multiple of 16.\n"
+                f"Current config: {self.num_heads} / {self.num_key_value_heads} = {gqa_ratio}\n"
+                f"Please adjust your Qwen3Config (e.g., 16 q_heads / 1 kv_head)."
+            )
+
+        # 3. Instantiate NSA Module
+        self.nsa_module = NativeSparseAttention(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            qkv_bias=config.attention_bias,
+            # Constraints & Hyperparams
+            block_size=getattr(config, "block_size", 64),  # Validated default
+            block_counts=getattr(config, "topk", 8),  # Validated default
+            window_size=getattr(config, "dma_window_size", 512),
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+            layer_idx=layer_idx,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        # Note: NSA handles RoPE internally via position_ids, but some implementations
+        # might ask for explicit cos/sin. The 'NativeSparseAttention' layer we verified
+        # handles standard HF inputs.
+
+        nsa_outputs = self.nsa_module(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+
+        # Handle various return formats safely
+        if isinstance(nsa_outputs, tuple):
+            return nsa_outputs
+
+        return nsa_outputs, None, past_key_value
+
+
 QWEN3_ATTENTION_CLASSES = {
     "eager": Qwen3Attention,
     "flash_attention_2": Qwen3FlashAttention2,
     "sdpa": Qwen3SdpaAttention,
-    "dma": Qwen3DMAAttention,
+    "native_sparse": Qwen3NativeSparseAttention,
 }
 
 
@@ -906,10 +820,11 @@ class Qwen3DecoderLayer(nn.Module):
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
-        if config.use_dma:
-            attn_implementation = "dma"
+        if config.use_nsa:
+            attn_implementation = "native_sparse"
         else:
             attn_implementation = config._attn_implementation
+
         self.self_attn = QWEN3_ATTENTION_CLASSES[attn_implementation](config, layer_idx)
 
         self.mlp = Qwen3MLP(config)
@@ -1309,6 +1224,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
     ):
         if self.config._attn_implementation == "flash_attention_2":
             # if attention_mask is not None and 0.0 in attention_mask:
+            return attention_mask
+            # return None
+        if self.config.use_nsa:
             return attention_mask
             # return None
 
